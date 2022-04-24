@@ -759,6 +759,9 @@ if __name__ == "__main__":
     rng = random.PRNGKey(42)
     rng, init_rng = random.split(rng)
 
+    # TODO(axl): How does model.init create the FrozenDict keys?
+    # Need "embedding" to be in init_variables['params'].keys() rather
+    # than "embed"
     @jax.jit
     def initialize_variables(init_rng):
         init_batch = jnp.ones((cfg.max_len, 1), jnp.float32)
@@ -766,9 +769,11 @@ if __name__ == "__main__":
         return init_variables
 
     init_variables = initialize_variables(init_rng)
+
     params = init_variables['params']
 
     # https://github.com/google/flax/issues/1004
+    # This last line does not work, see comment on param.keys() above
     transformer_fn = transformer.apply(
         params, inputs=inp, train=True, rngs={"dropout": dropout_rng}
     )
