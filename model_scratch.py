@@ -93,9 +93,11 @@ def dot_product_attention_weights(
     assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
     assert query.shape[-1] == key.shape[-1], "q, k depths must match."
 
+
     # calculate attention matrix
     depth = query.shape[-1]
     query = query / jnp.sqrt(depth).astype(dtype)
+
     # attn weight shape is (batch..., num_heads, q_length, kv_length)
     attn_weights = jnp.einsum("...qhd,...khd->...hqk", query, key, precision=precision)
 
@@ -199,6 +201,9 @@ def dot_product_attention(
     )
 
     # return weighted sum over values for each query position
+    # note that value and key are initialized to be the same `input_kv`
+    # `q` and `k` and query and key lengths, respectively
+    # `d` is the input D_emb divided by H_heads
     return jnp.einsum("...hqk,...khd->...qhd", attn_weights, value, precision=precision)
 
 
@@ -292,6 +297,7 @@ class MultiHeadDotProductAttention(Module):
         )
         # project inputs_q to multi-headed q/k/v
         # dimensions are then [batch..., length, n_heads, n_features_per_head]
+        # i.e. query, key, value shapes: (N, M, L, D_kv, D_kv, D_emb / H_heads)
         query, key, value = (
             dense(name="query")(inputs_q),
             dense(name="key")(inputs_kv),
@@ -720,15 +726,16 @@ class Transformer(nn.Module):
 if __name__ == "__main__":
 
     # Initialize dummy arrays
-    N = 6
-    L = 10
-    H = 3
-    D = 128
+    N_msas = 8
+    M_seqs = 50
+    L_max = 100
+    H_heads = 4
+    D_emb = 256
 
     rkey = random.PRNGKey(0)
     k1, k2, k3, k4 = random.split(rkey, 4)
-    query = random.normal(k1, (N, L, H, D))
-    key = random.normal(k2, (N, L, H, D))
+    query = random.normal(k1, (N_msas, M_seqs, L_max, H_heads, D_emb))
+    key = random.normal(k2, (N_msas, M_seqs, L_max, H_heads, D_emb))
 
     attn_weights = dot_product_attention_weights(query, key)
     print(attn_weights.shape)
@@ -745,35 +752,36 @@ if __name__ == "__main__":
     print(jax.tree_map(lambda x: print(x.shape), mh_attn_params))
 
     out = multi_head_attn.apply(mh_attn_params, query, key)
-    print(out.shape)  # (6, 10, 3, 128)
+    print(out.shape)  # (8, 50, 100, 4, 256)
+    # (N, M, L, H, D_emb)
 
 
     ######
     # Test transformer layer
 
-    dropout_rng = random.PRNGKey(10)
-    cfg = TransformerConfig(4, 4)
-    transformer = Transformer(cfg)
-    inp = random.normal(k3, (N, L))
+    # dropout_rng = random.PRNGKey(10)
+    # cfg = TransformerConfig(4, 4)
+    # transformer = Transformer(cfg)
+    # inp = random.normal(k3, (N, L))
 
-    rng = random.PRNGKey(42)
-    rng, init_rng = random.split(rng)
+    # rng = random.PRNGKey(42)
+    # rng, init_rng = random.split(rng)
 
-    # TODO(axl): How does model.init create the FrozenDict keys?
-    # Need "embedding" to be in init_variables['params'].keys() rather
-    # than "embed"
-    @jax.jit
-    def initialize_variables(init_rng):
-        init_batch = jnp.ones((cfg.max_len, 1), jnp.float32)
-        init_variables = transformer.init(init_rng, inputs=init_batch, train=False)
-        return init_variables
+    # # TODO(axl): How does model.init create the FrozenDict keys?
+    # # Need "embedding" to be in init_variables['params'].keys() rather
+    # # than "embed"
+    # @jax.jit
+    # def initialize_variables(init_rng):
+    #     init_batch = jnp.ones((cfg.max_len, 1), jnp.float32)
+    #     init_variables = transformer.init(init_rng, inputs=init_batch, train=False)
+    #     return init_variables
 
-    init_variables = initialize_variables(init_rng)
+    # init_variables = initialize_variables(init_rng)
 
-    params = init_variables['params']
+    # params = init_variables['params']
 
-    # https://github.com/google/flax/issues/1004
-    # This last line does not work, see comment on param.keys() above
-    transformer_fn = transformer.apply(
-        {'params': params}, inputs=inp, train=True, rngs={"dropout": dropout_rng}
-    )
+    # # https://github.com/google/flax/issues/1004
+    # # This last line does not work, see comment on param.keys() above
+    # transformer_fn = transformer.apply(
+    #     {'params': params}, inputs=inp, train=True, rngs={"dropout": dropout_rng}
+    # )

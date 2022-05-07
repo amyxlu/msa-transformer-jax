@@ -1,0 +1,4 @@
+# msa-transformer-jax
+This is a JAX implementation of MSA Transformer. Starting from a standard Transformer codebase from Flax examples, new modules are defined.
+
+The key is that the underlying modules for attention are different. To implement row-attention rather than column attention, a simple einsum trick will do. That is, in row attention you would have an attention map with shape  `(..., n_rows, n_rows)`, in column attention you would have an attention map with shape `(..., n_cols, n_cols)`. This requires only a simple change to the function used to calculate the attention matrix, and in fact, the heavy lifting is done using einsum. The additional dimension arising from the `n_sequences_per_msa` is also automatically taken care of by einsum.
