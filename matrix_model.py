@@ -2,9 +2,11 @@
 This is a barebones reimplementation of the code in model.py that works on matrices and not just vectors.
 """
 
+from doctest import OutputChecker
 import functools
 from typing import Any, Callable, Optional, Tuple
 
+from flax import linen as nn, struct
 from flax.linen.initializers import zeros
 from flax.linen.linear import default_kernel_init
 from flax.linen.linear import DenseGeneral
@@ -17,6 +19,7 @@ import jax
 from jax import lax
 from jax import random
 import jax.numpy as jnp
+import numpy as np
 
 PRNGKey = Any
 Shape = Tuple[int]
@@ -27,10 +30,11 @@ Array = Any
 def dot_product_attention(
     Q: Array,
     K: Array,
-    V: Array
+    V: Array,
+    dropout: nn.Module,
 ):
     """Computes dot-product attention given query key, and value matrices.
-    Currently, does not support dropout of attention probabilities or mask of padding tokens.
+    Currently, does not support masking padding tokens.
 
     Combines dot_product_attention_weights and dot_product_attention from model.py
     
@@ -38,13 +42,11 @@ def dot_product_attention(
         Q: query matrix with shape [batch, num_tokens, num_heads, d_qkv]
         K: key matrix with shape [batch, num_tokens, num_heads, d_qkv]
         V: values matrix with shape [batch, num_tokens, num_heads, d_qkv]
+        dropout: dropout module
     Returns:
         output of shape [batch, num_tokens, num_heads, d_qkv]
     """
     assert Q.shape == K.shape == V.shape
-
-    # calculate attention matrix 
-    d_qkv = Q.shape[-1]
 
     '''eisnum abbreviations:
         - h: num heads
@@ -55,24 +57,22 @@ def dot_product_attention(
     attention_logits = jnp.einsum("...qhd,...khd->...hqk", Q, K) # [batch, num_heads, num_tokens, num_tokens]
     attention_logits /= jnp.sqrt(Q.shape[-1])
     attention_probs = jax.nn.softmax(attention_logits, axis=-1)
+    attention_probs = dropout(attention_probs, deterministic=False)
     
     out = jnp.einsum("...hqk,...khd->...qhd", attention_probs, V)
-    return out
+    return dropout(out, deterministic=False)
 
 
 class MultiHeadSelfAttention(Module):
     """Multi-head self attention.
-    Does not support dropout, masking, or special autoregressive cache during decoding.
-    
-    Attributes:
-        n_heads: number of attention heads
-        d_qkv: dimension of the key, query, and value (this is per head, unlike model.py)
-        d_output: dimension of the output
+    Does not support masking or special autoregressive cache during decoding.
     """
 
-    n_heads: Optional[int] = 4
-    d_qkv: Optional[int] = 32
-    d_output: Optional[int] = 256
+    n_heads: Optional[int] = 8
+    d_qkv: Optional[int] = 64
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = zeros
+    dropout_rate: float = 0.0
 
     @compact
     def __call__(
@@ -85,12 +85,14 @@ class MultiHeadSelfAttention(Module):
         Args:
             inputs: input of shape [batch, n_tokens, d_input]
         Returns:
-            output of shape [batch, n_tokens, d_output]
+            output of shape [batch, n_tokens, d_input]
         """
         dense_QKV = functools.partial(
             DenseGeneral,
             axis=-1,
-            features=(self.n_heads, self.d_qkv)
+            features=(self.n_heads, self.d_qkv),
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init
         )
 
         # project inputs to multi-headed Q, K, V
@@ -101,16 +103,166 @@ class MultiHeadSelfAttention(Module):
             dense_QKV(name='value')(inputs)
         )
 
-        out = dot_product_attention(Q, K, V)
-
+        out = dot_product_attention(Q, K, V, nn.Dropout(rate=self.dropout_rate))
         return DenseGeneral(
-            features=self.d_output,
+            features=inputs.shape[-1],
             axis=(-2, -1),
-            name='out'
+            name='out',
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init
         )(out)
 
 
-def run_self_attention():
+@struct.dataclass
+class TransformerConfig:
+    input_vocab_size: int
+    output_vocab_size: int
+    emb_dim: int = 512
+    n_heads: int = 8
+    n_layers: int = 6
+    d_qkv: int = 64
+    d_mlp: int = 2048
+    max_len: int = 10_000 # code will not work on matrices with more this many elements
+    dropout_rate: float = 0.3
+    kernel_init: Callable = nn.initializers.xavier_uniform()
+    bias_init: Callable = nn.initializers.normal(stddev=1e-6)
+
+
+def sinusoidal_init(max_len=2048):
+    """1D Sinusoidal Position Embedding Initializer. Copied from implementatoin in model.py
+    Args:
+        max_len: maximum possible length for the input
+    Returns:
+        output: init function returning `(1, max_len, d_feature)`
+    """
+
+    def init(key, shape, dtype=np.float32):
+        """Sinusoidal init."""
+        del key, dtype
+        d_feature = shape[-1]
+        pe = np.zeros((max_len, d_feature), dtype=np.float32)
+        position = np.arange(0, max_len)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, d_feature, 2) * -(np.log(10000.0) / d_feature))
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        pe = pe[np.newaxis, :, :]  # [1, max_len, d_feature]
+        return jnp.array(pe)
+
+    return init
+
+
+class AddPositionalEmbedding(Module):
+    """Adds sinusoidal positional embeddings to the inputs
+    """
+
+    config: TransformerConfig
+
+    @compact
+    def __call__(self, inputs):
+        """
+        Args:
+            inputs: shape of [batch, n_tokens, d_input]
+        Returns:
+            output of shape [batch, n_tokens, d_input]
+        """
+        assert inputs.ndim == 3
+        pos_embeddings_shape = (1, self.config.max_len, inputs.shape[-1])
+        pos_embedding = sinusoidal_init(max_len=self.config.max_len)(None, pos_embeddings_shape, None)
+        pe = pos_embedding[:, :inputs.shape[1], :]
+        return inputs + pe
+
+
+class PositionwiseFeedForward(Module):
+    config: TransformerConfig
+
+    @compact
+    def __call__(self, inputs):
+        """
+        Args:
+            inputs: shape of [batch, n_tokens, d_input]
+        Returns:
+            output of shape [batch, n_tokens, d_input]
+        """
+        out_dim = inputs.shape[-1]
+        x = DenseGeneral(
+            features=self.config.d_mlp,
+            kernel_init=self.config.kernel_init,
+            bias_init=self.config.bias_init
+        )(inputs)
+        x = nn.elu(x)
+        x = nn.Dropout(rate=self.config.dropout_rate)(x, deterministic=False)
+        x = DenseGeneral(
+            features=out_dim,
+            kernel_init=self.config.kernel_init,
+            bias_init=self.config.bias_init
+        )(x)
+        return nn.Dropout(rate=self.config.dropout_rate)(x, deterministic=False)
+
+
+class TransformerEncoderLayer(nn.Module):
+    config: TransformerConfig
+
+    @compact
+    def __call__(self, inputs):
+        """Applies one layer of the Transformer encoder.
+        Args:
+            inputs: shape of [batch, n_tokens, d_input]
+        Returns: output of shape [batch, n_tokens, d_input]
+        """
+        assert inputs.ndim == 3
+        x = nn.LayerNorm()(inputs)
+
+        x = MultiHeadSelfAttention(
+            n_heads=self.config.n_heads,
+            d_qkv=self.config.d_qkv,
+            kernel_init=self.config.kernel_init,
+            bias_init=self.config.bias_init,
+            dropout_rate=self.config.dropout_rate
+        )(x)
+        x = nn.LayerNorm()(x + inputs)
+        y = PositionwiseFeedForward(self.config)(x)
+        return x + y
+
+
+class Transformer(nn.Module):
+    config: TransformerConfig
+
+    @compact
+    def __call__(self, inputs):
+        """Applies Transformer model on the inputs.
+        Args:
+            inputs: shape of [batch, n_rows, n_cols]
+        Returns:
+            output of shape [batch, n_rows, n_cols, output_vocab_size]
+        """
+        assert inputs.ndim == 3
+
+        x = inputs.astype("int32")
+        x = jnp.reshape(x, (inputs.shape[0], inputs.shape[1] * inputs.shape[2]))
+
+        x = nn.Embed(
+            num_embeddings=self.config.input_vocab_size,
+            features = self.config.emb_dim
+        )(x)
+        x = nn.Dropout(rate=self.config.dropout_rate)(x, deterministic=False)
+        x = AddPositionalEmbedding(self.config)(x)
+
+        for _ in range(self.config.n_layers):
+            x = TransformerEncoderLayer(self.config)(x)
+
+        x = nn.LayerNorm()(x)
+        logits = nn.Dense(
+            self.config.output_vocab_size,
+            kernel_init=self.config.kernel_init,
+            bias_init=self.config.bias_init
+        )(x)
+
+        logits = jnp.reshape(logits, (inputs.shape[0], inputs.shape[1], inputs.shape[2], logits.shape[-1]))
+        return logits
+
+
+def test_self_attention():
+    print("Checking self attention on 1D sequence")
     B, L, D = 10, 128, 200
     H = 6
 
@@ -122,10 +274,35 @@ def run_self_attention():
     params = model.init(k2, x)
     y = model.apply(params, x)
 
-    print("initialized parameter shapes: \n", jax.tree_map(jnp.shape, params))
-    print("output shape: \n", y.shape)
+    desired_shape = (B, L, D)
+    assert y.shape == desired_shape, f"output shape is {y.shape} instead of {desired_shape}"
+
+
+def test_transformer_on_matrix():
+    print("Running transformer on a matrix")
+    batch_size, n_rows, n_cols = 10, 30, 30
+    vocab_size = 200
+    config = TransformerConfig(
+        input_vocab_size=vocab_size,
+        output_vocab_size=vocab_size
+    )
+
+    rng = random.PRNGKey(42)
+    input_rng, init_rng = random.split(rng)
+    dropout_rng = random.PRNGKey(10)
+
+    input_logits = random.uniform(input_rng, (batch_size, n_rows, n_cols, vocab_size))
+    inputs = random.categorical(input_rng, input_logits, axis=-1)
+
+    transformer = Transformer(config)
+    params = transformer.init({"params": init_rng, "dropout": dropout_rng}, inputs)
+    y = transformer.apply(params, inputs, rngs={"dropout": dropout_rng})
+
+    desired_shape = (batch_size, n_rows, n_cols, vocab_size)
+    assert y.shape == desired_shape, f"output shape is {y.shape} instead of {desired_shape}"
 
 
 if __name__ == '__main__':
-    run_self_attention()
+    test_self_attention()
+    test_transformer_on_matrix()
 
