@@ -775,5 +775,5 @@ if __name__ == "__main__":
     # https://github.com/google/flax/issues/1004
     # This last line does not work, see comment on param.keys() above
     transformer_fn = transformer.apply(
-        params, inputs=inp, train=True, rngs={"dropout": dropout_rng}
+        {'params': params}, inputs=inp, train=True, rngs={"dropout": dropout_rng}
     )
