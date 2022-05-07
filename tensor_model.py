@@ -19,6 +19,7 @@ import jax
 from jax import lax
 from jax import random
 import jax.numpy as jnp
+import math
 import numpy as np
 
 PRNGKey = Any
@@ -229,17 +230,22 @@ class Transformer(nn.Module):
 
     @compact
     def __call__(self, inputs):
-        """Applies Transformer model on the inputs.
+        """Applies a Transformer model on inputs of arbitrary size. Performs full self-attention
+        between all tokens. Because the MultiHeadSelfAttention module only works only on
+        1-dimensional arrays, the input is flattened first.
         Args:
-            inputs: shape of [batch, n_rows, n_cols]
+            inputs: shape of [batch, input_shape...]
         Returns:
-            output of shape [batch, n_rows, n_cols, output_vocab_size]
+            output of shape [batch, input_shape..., output_vocab_size]
         """
-        assert inputs.ndim == 3
+        assert inputs.ndim >= 2
 
         x = inputs.astype("int32")
-        x = jnp.reshape(x, (inputs.shape[0], inputs.shape[1] * inputs.shape[2]))
 
+        # Flatten the input
+        n_tokens = math.prod([inputs.shape[i] for i in range(1, inputs.ndim)])
+        x = jnp.reshape(x, (inputs.shape[0], n_tokens))
+        
         x = nn.Embed(
             num_embeddings=self.config.input_vocab_size,
             features = self.config.emb_dim
@@ -257,30 +263,34 @@ class Transformer(nn.Module):
             bias_init=self.config.bias_init
         )(x)
 
-        logits = jnp.reshape(logits, (inputs.shape[0], inputs.shape[1], inputs.shape[2], logits.shape[-1]))
+        # Unflatten the logits
+        logits = jnp.reshape(logits, (*inputs.shape, logits.shape[-1]))
         return logits
 
 
 def test_self_attention():
     print("Checking self attention on 1D sequence")
-    B, L, D = 10, 128, 200
-    H = 6
+    batch_size, length, dim = 10, 128, 200
+    n_heads = 6
 
     rkey = random.PRNGKey(0)
     k1, k2 = random.split(rkey, 2)
-    x = random.uniform(k1, (B, L, D))
+    x = random.uniform(k1, (batch_size, length, dim))
 
-    model = MultiHeadSelfAttention(n_heads=H)
+    model = MultiHeadSelfAttention(n_heads=n_heads)
     params = model.init(k2, x)
     y = model.apply(params, x)
 
-    desired_shape = (B, L, D)
+    desired_shape = (batch_size, length, dim)
     assert y.shape == desired_shape, f"output shape is {y.shape} instead of {desired_shape}"
 
 
-def test_transformer_on_matrix():
-    print("Running transformer on a matrix")
-    batch_size, n_rows, n_cols = 10, 30, 30
+def test_transformer_on_tensor(input_shape: tuple):
+    """Tests forward pass of a transformer on an arbitrary tensor.
+    Args:
+        input_shape: first dimension must be the batch size
+    """
+    print(f"Running transformer on input with shape: {input_shape}")
     vocab_size = 200
     config = TransformerConfig(
         input_vocab_size=vocab_size,
@@ -291,18 +301,20 @@ def test_transformer_on_matrix():
     input_rng, init_rng = random.split(rng)
     dropout_rng = random.PRNGKey(10)
 
-    input_logits = random.uniform(input_rng, (batch_size, n_rows, n_cols, vocab_size))
+    input_logits = random.uniform(input_rng, (*input_shape, vocab_size))
     inputs = random.categorical(input_rng, input_logits, axis=-1)
 
     transformer = Transformer(config)
     params = transformer.init({"params": init_rng, "dropout": dropout_rng}, inputs)
     y = transformer.apply(params, inputs, rngs={"dropout": dropout_rng})
 
-    desired_shape = (batch_size, n_rows, n_cols, vocab_size)
+    desired_shape = (*input_shape, vocab_size)
     assert y.shape == desired_shape, f"output shape is {y.shape} instead of {desired_shape}"
 
 
 if __name__ == '__main__':
     test_self_attention()
-    test_transformer_on_matrix()
-
+    test_transformer_on_tensor((10, 500))
+    test_transformer_on_tensor((10, 30, 30))
+    test_transformer_on_tensor((10, 10, 10, 10))
+    test_transformer_on_tensor((10, 5, 5, 5, 5))
