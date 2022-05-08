@@ -1,4 +1,5 @@
 from typing import Any, Tuple, Callable
+from functools import partial
 
 import flax.linen as nn
 import jax
@@ -13,13 +14,7 @@ Array = Any
 
 
 def masked_fill(mask, a, fill):
-    return jax.lax.select(mask, a, jax.lax.broadcast(fill, a.shape))
-
-
-@nn.compact
-def qkv_project(x: Array, embed_dim: int, shape: Shape):
-    x = nn.Dense(embed_dim, embed_dim)(x)
-    return jnp.reshape(x, shape)
+    return jnp.where(mask, a, fill_value=fill)
 
 
 class RowSelfAttention(nn.Module):
@@ -27,7 +22,7 @@ class RowSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: Array, deterministic: bool, self_attn_padding_mask: Array = None
+        self, x: Array, deterministic: bool = False, self_attn_padding_mask: Array = None
     ):
         """
 
@@ -40,10 +35,10 @@ class RowSelfAttention(nn.Module):
         head_dim = cfg.embed_dim // cfg.attention_heads
 
         num_rows, num_cols, batch_size, embed_dim = x.shape
-        shape = (num_rows, num_cols, batch_size, embed_dim, head_dim)
-        q = qkv_project(x, shape)
-        k = qkv_project(x, shape)
-        v = qkv_project(x, shape)
+        shape = (num_rows, num_cols, batch_size, cfg.attention_heads, head_dim)
+        q = nn.Dense(embed_dim)(x).reshape(shape)
+        k = nn.Dense(embed_dim)(x).reshape(shape)
+        v = nn.Dense(embed_dim)(x).reshape(shape)
 
         # dividing by sqrt(num_rows) is only done for row self attention in original code
         scaling = (head_dim**-0.5) / math.sqrt(num_rows)
@@ -52,18 +47,30 @@ class RowSelfAttention(nn.Module):
         # For row attention, zero out any padded aligned positions for query;
         # this is important since we take a sum across the alignment axis.
         if self_attn_padding_mask is not None:
-            self_attn_padding_mask = jnp.transpose(
-                self_attn_padding_mask, axes=(1, 2, 0)
-            )
-            self_attn_padding_mask = jnp.expand_dims(
-                self_attn_padding_mask, axis=(3, 4)
-            )
-            q *= 1 - self_attn_padding_mask
+            # mask shape: (batch_size, n_rows, n_cols)
+            # (B, R, C) -> (R, C, B)
+            q_mask = self_attn_padding_mask.copy()
+            q_mask = jnp.transpose(q_mask, axes=(1, 2, 0))
 
+            # (R, C, B) -> (R, C, B, 1, 1)
+            q_mask = jnp.expand_dims(q_mask, axis=(3, 4))
+
+            # (R, C, B, 1, 1) -> (R, C, B, H, D)
+            q_mask = jnp.broadcast_to(q_mask, q.shape)
+            q *= 1 - q_mask
+
+        # For the final version, tied attention is used, so the row dimension "disappears"
+        # such that all rows share the same attention weights.
         # https://github.com/rmrao/msa-transformer/blob/main/modules.py#L774
         attn_weights = jnp.einsum(f"rinhd,rjnhd->hnij", q, k)
+
         if self_attn_padding_mask is not None:
-            attn_weights = masked_fill(self_attn_padding_mask, attn_weights, -10000)
+            # (B, R, C) -> (H, B, C, C)
+            attn_mask = jnp.expand_dims(self_attn_padding_mask[:, 0, :], axis=(0,3))
+            attn_mask = jnp.broadcast_to(attn_mask, attn_weights.shape)
+            import pdb;pdb.set_trace()
+            attn_weights = jnp.where(condition=attn_mask, x=attn_weights, y=jnp.full(attn_weights.shape, -10000))
+
 
         attn_probs = nn.softmax(attn_weights, axis=-1)
         attn_probs = nn.Dropout(rate=cfg.attention_dropout)(
@@ -72,7 +79,7 @@ class RowSelfAttention(nn.Module):
 
         context = jnp.einsum("hnij,rjnhd->rinhd", attn_probs, v)
         context = jnp.reshape(context, (num_rows, num_cols, batch_size, embed_dim))
-        output = self.out_proj(context)
+        output = nn.Dense(embed_dim)(context)
 
         # return attn weights for inspection if needed
         return output
@@ -83,7 +90,7 @@ class ColumnSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: Array, deterministic: bool, self_attn_padding_mask: Array = None
+        self, x: Array, deterministic: bool = False, self_attn_padding_mask: Array = None
     ):
         """
 
@@ -96,7 +103,7 @@ class ColumnSelfAttention(nn.Module):
         head_dim = cfg.embed_dim // cfg.attention_heads
 
         num_rows, num_cols, batch_size, embed_dim = x.shape
-        qkv_shape = (num_rows, num_cols, batch_size, embed_dim, head_dim)
+        qkv_shape = (num_rows, num_cols, batch_size, cfg.attention_heads, head_dim)
 
         if num_rows == 1:
             # if there is only 1 position, this is equivalent and doesn't break with
@@ -105,15 +112,15 @@ class ColumnSelfAttention(nn.Module):
                 (cfg.attention_heads, num_cols, batch_size, num_rows, num_rows),
                 dtype=x.dtype,
             )
-            output = qkv_project(qkv_project(x))
+            output = nn.Dense(embed_dim)(x)
 
         else:
-            q = qkv_project(x, qkv_shape)
-            k = qkv_project(x, qkv_shape)
-            v = qkv_project(x, qkv_shape)
+            q = nn.Dense(embed_dim)(x).reshape(qkv_shape)
+            k = nn.Dense(embed_dim)(x).reshape(qkv_shape)
+            v = nn.Dense(embed_dim)(x).reshape(qkv_shape)
 
             # dividing by sqrt(num_rows) is only done for row self attention in original code
-            scaling = head_dim**-0.5
+            scaling = head_dim ** -0.5
             q *= scaling
 
             # https://github.com/rmrao/msa-transformer/blob/main/modules.py#L907
@@ -133,36 +140,23 @@ class ColumnSelfAttention(nn.Module):
             # https://github.com/rmrao/msa-transformer/blob/main/modules.py#L919
             context = jnp.einsum("hcnij,jcnhd->icnhd", attn_probs, v)
             context = jnp.reshape(context, (num_rows, num_cols, batch_size, embed_dim))
-            output = self.out_proj(context)
+            output = nn.Dense(embed_dim)(context)
 
         # return attn weights for inspection if needed
         return output
 
 
 class FeedForwardNetwork(nn.Module):
-    config = MSATransformerConfig
+    config: MSATransformerConfig
 
     @nn.compact
-    def __call__(self, x, deterministic):
+    def __call__(self, x, deterministic: bool = False):
         cfg = self.config
         x = nn.Dense(cfg.ffn_embed_dim)(x)
         x = nn.gelu(x)
         x = nn.Dense(cfg.embed_dim)(x)
         x = nn.Dropout(rate=cfg.activation_dropout)(x, deterministic=deterministic)
         return x
-
-
-class NormalizedResidualBlock(nn.Module):
-    config: MSATransformerConfig
-    layer: Callable
-
-    @nn.compact
-    def __call__(self, inputs, deterministic):
-        cfg = self.config
-        x = nn.LayerNorm()(inputs)
-        x = self.layer(x, deterministic)
-        x = nn.Dropout(rate=cfg.dropout)(x, deterministic=deterministic)
-        return x + inputs
 
 
 class AxialMSAEncoderBlock(nn.Module):
@@ -179,7 +173,7 @@ class AxialMSAEncoderBlock(nn.Module):
     config: MSATransformerConfig
 
     @nn.compact
-    def __call__(self, inputs, deterministic, self_attn_padding_mask=None):
+    def __call__(self, inputs: Array, deterministic: bool = False, self_attn_padding_mask: Array = None):
         """Applies the MSA encoder module to an input batch of MSAs
 
         Args:
@@ -193,22 +187,30 @@ class AxialMSAEncoderBlock(nn.Module):
         row_attn = RowSelfAttention(cfg)
         column_attn = ColumnSelfAttention(cfg)
         ffn = FeedForwardNetwork(cfg)
+        x = inputs.copy()
 
-        row_attn_block = NormalizedResidualBlock(cfg, row_attn)
-        column_attn_block = NormalizedResidualBlock(cfg, column_attn)
-        ffn_block = NormalizedResidualBlock(cfg, ffn)
+        # Row attention residual block w/ normalization
+        x = row_attn(nn.LayerNorm()(x), deterministic, self_attn_padding_mask)
+        x = nn.Dropout(rate=cfg.dropout)(x, deterministic)
 
-        x = row_attn_block(inputs, deterministic, self_attn_padding_mask)
-        x = column_attn_block(x, deterministic, self_attn_padding_mask)
-        x = ffn_block(x, deterministic)
+        # Column attention residual block w/ normalization
+        x = column_attn(nn.LayerNorm()(x), deterministic, self_attn_padding_mask)
+        x = nn.Dropout(rate=cfg.dropout)(x, deterministic)
+
+        # Feed-forward residual block w/ normalization
+        x = ffn(nn.LayerNorm()(x), deterministic)
+        x = nn.Dropout(rate=cfg.dropout)(x, deterministic)
 
         return x
 
 
 if __name__ == "__main__":
     from jax import random
-    rkey = random.PRNGKey(0)
-    k1, k2, k3, k4 = random.split(rkey, 4)
+    from configs import MSATransformerConfig
+
+    rng = random.PRNGKey(0)
+    init_rng, dropout_rng, input_rng = random.split(rng, 3)
+    cfg = MSATransformerConfig()
 
     # Initialize dummy arrays
     # https://github.com/facebookresearch/esm/blob/main/esm/model.py#L367
@@ -216,12 +218,7 @@ if __name__ == "__main__":
     N_msas = 8
     num_cols = 100
     num_rows = 12
-    H_heads = 4
-    D_emb = 256
-    inputs = random.randint(k1, (num_rows, num_cols, N_msas, D_emb), 0, 20)
-
-    cfg = MSATransformerConfig()
+    inputs = random.randint(input_rng, (num_rows, num_cols, N_msas, cfg.embed_dim), 0, 20)
     encoder = AxialMSAEncoderBlock(cfg)
-
-    enc_params = encoder.init(k2, inputs, deterministic=True)
-    out = encoder.apply(enc_params, inputs, deterministic=True)
+    encoder_params = encoder.init({"params": init_rng, "dropout": dropout_rng}, inputs)
+    out = encoder.apply(encoder_params, inputs, deterministic=True)
