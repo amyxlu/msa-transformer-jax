@@ -115,8 +115,9 @@ class ParallelizedModel():
         
         # create dummy sample one-hot inputs used to initialize the model
         sample_input_shape = (sample_input_batch_size, *input_shape)
-        sample_input_logits = random.uniform(self.input_rng, (*sample_input_shape, config.input_vocab_size))
-        sample_inputs = random.categorical(self.input_rng, sample_input_logits, axis=-1)
+        sample_inputs = random.uniform(self.input_rng, sample_input_shape)
+#         sample_input_logits = random.uniform(self.input_rng, (*sample_input_shape, config.input_vocab_size))
+#         sample_inputs = random.categorical(self.input_rng, sample_input_logits, axis=-1)
         
         # create and initialize model
         self.model = module_class(config)
@@ -229,7 +230,8 @@ def MNIST_test():
             n_heads=4,
             dropout_rate=0.1
         )
-    model = ParallelizedModel(MnistViT, config, (28, 28))
+    model = ParallelizedModel(CNN, None, (28, 28, 1))
+#     model = ParallelizedModel(MnistViT, config, (28, 28))
     
     # random seed for shuffling training dataset
     rng = jax.random.PRNGKey(0)
