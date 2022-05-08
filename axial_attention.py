@@ -27,7 +27,7 @@ class RowSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: Array, self_attn_padding_mask: Array = None, deterministic=True
+        self, x: Array, deterministic: bool, self_attn_padding_mask: Array = None
     ):
         """
 
@@ -83,7 +83,7 @@ class ColumnSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: Array, self_attn_padding_mask: Array = None, deterministic=True
+        self, x: Array, deterministic: bool, self_attn_padding_mask: Array = None
     ):
         """
 
@@ -140,8 +140,6 @@ class ColumnSelfAttention(nn.Module):
 
 
 class FeedForwardNetwork(nn.Module):
-    # TODO(axl): architecutre should match
-    #  https://github.com/rmrao/msa-transformer/blob/main/modules.py#L404
     config = MSATransformerConfig
 
     @nn.compact
@@ -162,12 +160,12 @@ class NormalizedResidualBlock(nn.Module):
     def __call__(self, inputs, deterministic):
         cfg = self.config
         x = nn.LayerNorm()(inputs)
-        x = self.layer(x)
+        x = self.layer(x, deterministic)
         x = nn.Dropout(rate=cfg.dropout)(x, deterministic=deterministic)
         return x + inputs
 
 
-class MSAEncoderBlock(nn.Module):
+class AxialMSAEncoderBlock(nn.Module):
     """
     See Fig 1. (right) of Rao et al. Each encoder block consists of
     a row self-attention block, a column self-attention block, and
@@ -181,7 +179,7 @@ class MSAEncoderBlock(nn.Module):
     config: MSATransformerConfig
 
     @nn.compact
-    def __call__(self, inputs, deterministic):
+    def __call__(self, inputs, deterministic, self_attn_padding_mask=None):
         """Applies the MSA encoder module to an input batch of MSAs
 
         Args:
@@ -191,41 +189,39 @@ class MSAEncoderBlock(nn.Module):
           Output (i.e. embedding) after transformer encoder for MLM loss, etc.
         """
         cfg = self.config
-        assert inputs.ndim == 5
 
-        self_attn = nn.SelfAttention(
-            num_heads=cfg.attention_heads,
-            use_bias=cfg.use_attn_weight_bias,
-            broadcast_dropout=False,  #TODO(axl) do we need dropout across M?
-            dropout_rate=cfg.attention_dropout,
-            deterministic=deterministic,
-        )
-        row_attn_block = NormalizedResidualBlock(cfg, self_attn)
-        column_attn_block = NormalizedResidualBlock(cfg, self_attn)
-        mlp_block = NormalizedResidualBlock(cfg, nn.Dense()) #TODO: n dimensions
+        row_attn = RowSelfAttention(cfg)
+        column_attn = ColumnSelfAttention(cfg)
+        ffn = FeedForwardNetwork(cfg)
 
-        x = row_attn_block(inputs)
-        x = column_attn_block(x)
-        x = mlp_block(x)
+        row_attn_block = NormalizedResidualBlock(cfg, row_attn)
+        column_attn_block = NormalizedResidualBlock(cfg, column_attn)
+        ffn_block = NormalizedResidualBlock(cfg, ffn)
+
+        x = row_attn_block(inputs, deterministic, self_attn_padding_mask)
+        x = column_attn_block(x, deterministic, self_attn_padding_mask)
+        x = ffn_block(x, deterministic)
 
         return x
 
 
+if __name__ == "__main__":
+    from jax import random
+    rkey = random.PRNGKey(0)
+    k1, k2, k3, k4 = random.split(rkey, 4)
+
     # Initialize dummy arrays
+    # https://github.com/facebookresearch/esm/blob/main/esm/model.py#L367
+    # (R, C, B, D)
     N_msas = 8
     num_cols = 100
     num_rows = 12
     H_heads = 4
     D_emb = 256
+    inputs = random.randint(k1, (num_rows, num_cols, N_msas, D_emb), 0, 20)
 
-    rkey = random.PRNGKey(0)
-    k1, k2, k3, k4 = random.split(rkey, 4)
+    cfg = MSATransformerConfig()
+    encoder = AxialMSAEncoderBlock(cfg)
 
-    # Multi head attention
-    multi_head_attn = nn.MultiHeadDotProductAttention(H_heads)
-
-    row_input_q = random.randint(k1, (N_msas, num_rows, num_cols, H_heads, D_emb), 0, 20)
-    col_input_q = random.randint(k2, (N_msas, num_cols, num_rows, H_heads, D_emb), 0, 20)
-
-    mh_attn_params = multi_head_attn.init(k1, row_input_q, row_input_q)
-    out = multi_head_attn.apply(mh_attn_params, row_input_q, row_input_q)
+    enc_params = encoder.init(k2, inputs, deterministic=True)
+    out = encoder.apply(enc_params, inputs, deterministic=True)

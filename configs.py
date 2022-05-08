@@ -16,6 +16,8 @@ class MSATransformerConfig:
     activation_dropout: float = 0.1
     max_tokens_per_msa: int = 2 ** 14
     use_attn_weight_bias: bool = False
+    vocab_size: int = 33
+
 
 """
 Smaller config for testing
@@ -29,5 +31,3 @@ class SmallConfig(MSATransformerConfig):
     dropout: float = 0.1
     attention_dropout: float = 0.1
     activation_dropout: float = 0.1
-    max_tokens_per_msa: int = 2 ** 14
-
