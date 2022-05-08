@@ -117,7 +117,7 @@ class MultiHeadSelfAttention(Module):
 @struct.dataclass
 class TransformerConfig:
     input_vocab_size: int
-    output_vocab_size: int
+    output_size: int
     emb_dim: int = 512
     n_heads: int = 8
     n_layers: int = 6
@@ -236,7 +236,7 @@ class Transformer(nn.Module):
         Args:
             inputs: shape of [batch, input_shape...]
         Returns:
-            output of shape [batch, input_shape..., output_vocab_size]
+            output of shape [batch, input_shape..., output_size]
         """
         assert inputs.ndim >= 2
 
@@ -257,15 +257,15 @@ class Transformer(nn.Module):
             x = TransformerEncoderLayer(self.config)(x)
 
         x = nn.LayerNorm()(x)
-        logits = nn.Dense(
-            self.config.output_vocab_size,
+        outputs = nn.Dense(
+            self.config.output_size,
             kernel_init=self.config.kernel_init,
             bias_init=self.config.bias_init
         )(x)
 
-        # Unflatten the logits
-        logits = jnp.reshape(logits, (*inputs.shape, logits.shape[-1]))
-        return logits
+        # Unflatten the outputs
+        outputs = jnp.reshape(outputs, (*inputs.shape, outputs.shape[-1]))
+        return outputs
 
 
 def test_self_attention():
