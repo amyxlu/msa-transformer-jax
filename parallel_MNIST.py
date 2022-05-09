@@ -5,6 +5,8 @@ Parallelized version of the tensor_model transformer
 from doctest import OutputChecker
 import functools
 from typing import Any, Callable, Optional, Tuple
+import copy
+import dataclasses
 
 from flax import linen as nn, struct
 from flax.linen.initializers import zeros
@@ -69,7 +71,7 @@ class MnistViT(nn.Module):
         self.transformer = Transformer(self.config)
         self.dense = nn.Dense(features=10)    
 
-    def __call__(self, inputs):
+    def __call__(self, inputs, deterministic=None):
         """Applies a Transformer, a mean pooling of output embddings for each pixel, followed by 
         a dense layer to predict the class of each image.
         Args:
@@ -77,7 +79,7 @@ class MnistViT(nn.Module):
         Returns:
             logits of shape [batch, 10]
         """
-        out = self.transformer(inputs) # shape: [batch, 28, 28, 32 /*output size */]
+        out = self.transformer(inputs, deterministic=deterministic) # shape: [batch, 28, 28, 32 /*output size */]
         out = jnp.mean(out, axis=(1, 2)).squeeze()
         out = self.dense(out)
         return out
@@ -114,70 +116,72 @@ class ParallelizedModel():
         self.init_rng, self.dropout_rng, self.input_rng = random.split(self.rng, num=3)
         
         # create dummy sample one-hot inputs used to initialize the model
-        sample_input_shape = (sample_input_batch_size, *input_shape)
-        sample_input_logits = random.uniform(self.input_rng, (*sample_input_shape, config.input_vocab_size))
-        sample_inputs = random.categorical(self.input_rng, sample_input_logits, axis=-1)
+        if module_class == MnistViT:
+            sample_input_shape = (sample_input_batch_size, *input_shape)
+            sample_input_logits = random.uniform(self.input_rng, (*sample_input_shape, config.input_vocab_size))
+            sample_inputs = random.categorical(self.input_rng, sample_input_logits, axis=-1)
+        elif module_class == CNN:
+            sample_input_shape = (sample_input_batch_size, *input_shape)
+            sample_inputs = random.uniform(self.input_rng, sample_input_shape)
         
         # create and initialize model
         self.model = module_class(config)
-        self.model_params = self.model.init({"params": self.init_rng, "dropout": self.dropout_rng}, sample_inputs)
+        self.model_params = self.model.init({"params": self.init_rng, "dropout": self.dropout_rng}, sample_inputs, deterministic=True)
         
         # create pjit mesh to shard the model along the second input dimension (usually, the length of the sequence)
         self.mesh_shape = (1, n_gpus)
         self.devices = np.asarray(jax.devices()[:n_gpus]).reshape(*self.mesh_shape)
         self.mesh = maps.Mesh(self.devices, ('batch', 'length'))
         
-        self.model_pjit = pjit(lambda model_params, inputs: self.model.apply(model_params, inputs, 
-                                                                             rngs={"dropout": self.dropout_rng}),
+        # define the train step pjit
+        def train_step(state, dropout_rng, inputs, labels):
+            """Train for a single step."""
+            dropout_rng, new_dropout_rng = random.split(dropout_rng)            
+            def loss_fn(params):
+                logits = module_class(config).apply(params, inputs, deterministic=False, rngs={"dropout": dropout_rng})
+                loss = cross_entropy_loss(logits=logits, labels=labels)            
+                return loss, logits
+
+            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+            (_, logits), grads = grad_fn(state.params)
+            state = state.apply_gradients(grads=grads)
+            metrics = compute_metrics(logits=logits, labels=labels)
+            return state, metrics, new_dropout_rng
+        
+        self.train_step_pjit = pjit(lambda state, dropout_rng, inputs, labels: train_step(state, dropout_rng, inputs, labels),\
+                                    in_axis_resources=[None, None, PartitionSpec('batch', 'length'), PartitionSpec('batch')],
+                                    out_axis_resources=None)
+        
+        # define the normal forward pass pjit for evaluation   
+        self.eval_config = self.eval_config = dataclasses.replace(config, dropout_rate=0)
+        self.forward_pjit = pjit(lambda model_params, inputs: module_class(self.eval_config).apply(model_params, inputs, deterministic=True),
                                in_axis_resources=[None, PartitionSpec('batch', 'length')],
                                out_axis_resources=PartitionSpec('batch'))
-    
-    def forward(self, params, inputs):
-        """Forward pass of the model
-        Args:
-            params: the parameters of the model
-            inputs: the inputs to the model for the forward pass
-        Returns:
-            logits: the outputs of the forward pass
-        """            
-        with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
-            logits = self.model_pjit(params, inputs)
-        return logits
-    
+
     def create_train_state(self, optimizer_module, **optimize_params):
         """Creates initial `TrainState`."""
         self.optimizer = optimizer_module(**optimize_params)
-        self.state = train_state.TrainState.create(apply_fn=self.forward, params=self.model_params, tx=self.optimizer)
-    
-    def train_step(self, state, inputs, labels):        
-        """Train for a single step."""
-        def loss_fn(params):
-            logits = self.forward(params, inputs)
-            loss = cross_entropy_loss(logits=logits, labels=labels)            
-            return loss, logits
-        
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (_, logits), grads = grad_fn(state.params)
-        state = state.apply_gradients(grads=grads)
-        metrics = compute_metrics(logits=logits, labels=labels)
-        return state, metrics
+        self.state = train_state.TrainState.create(apply_fn=self.train_step_pjit, params=self.model_params, tx=self.optimizer)
 
     def eval_step(self, inputs, labels):
-        logits = self.forward(params, inputs)
+        with self.mesh as m:
+            logits = self.forward_pjit(params, inputs)
         return compute_metrics(logits=logits, labels=labels)
-    
+
     def train_epoch(self, train_ds, batch_size, epoch, rng, inputs_name="image", labels_name="label"):
         """Train for a single epoch."""
         train_ds_size = len(train_ds[inputs_name])
         steps_per_epoch = train_ds_size // batch_size
-
+        
+        rng, dropout_rng = random.split(rng)
         perms = jax.random.permutation(rng, train_ds_size)
         perms = perms[:steps_per_epoch * batch_size]  # skip incomplete batch
         perms = perms.reshape((steps_per_epoch, batch_size))
         batch_metrics = []
         for perm in tqdm(perms):
             batch = {k: v[perm, ...] for k, v in train_ds.items()}
-            self.state, metrics = self.train_step(self.state, batch[inputs_name], batch[labels_name])
+            with self.mesh as m:
+                self.state, metrics, dropout_rng = self.train_step_pjit(self.state, dropout_rng, batch[inputs_name], batch[labels_name])
             batch_metrics.append(metrics)
 
         # compute mean of metrics across each batch in epoch.
@@ -188,21 +192,29 @@ class ParallelizedModel():
 
         print('train epoch: %d, loss: %.4f, accuracy: %.2f' % (
           epoch, epoch_metrics_np['loss'], epoch_metrics_np['accuracy'] * 100))
-        
-    def eval_model(self, test_ds, epoch, inputs_name="image", labels_name="label"):
-        batch_metrics = []
-        for i in range(len(test_ds[inputs_name])):
-            batch_data = {k: v[[i], ...] for k, v in test_ds.items()}
-            metrics = eval_step(params, batch_data)
-            batch_metrics.append(metrics)
 
-        print_metrics(batch_metrics, epoch, train=False)
+    def eval_model(self, test_ds, batch_size, epoch, inputs_name="image", labels_name="label"):
+        # get all predictions for test_ds
+        all_preds = []
+        all_labels = []
+        for i in tqdm(range(0, len(test_ds[inputs_name]), batch_size)):
+            batch = {k: v[np.arange(i, min(i+batch_size, len(test_ds[inputs_name]))), ...] for k, v in test_ds.items()}
+            with self.mesh as m:
+                batch_preds = self.forward_pjit(self.state.params, batch[inputs_name])
+                
+            all_preds.append(jax.device_get(batch_preds))
+            all_labels.append(batch[labels_name])
         
-    def eval_model(self, test_ds):
-        metrics = self.eval_step(self.model_params, test_ds)
-        metrics = jax.device_get(metrics)
-        summary = jax.tree_map(lambda x: x.item(), metrics)
-        return summary['loss'], summary['accuracy']
+        # stack them
+        all_preds = np.vstack(all_preds)
+        all_labels = np.hstack(all_labels)
+        
+        # compute metrics
+        epoch_metrics_np = compute_metrics(logits=all_preds, labels=all_labels)
+        
+        print('test epoch: %d, loss: %.4f, accuracy: %.2f' % (
+          epoch, epoch_metrics_np['loss'], epoch_metrics_np['accuracy'] * 100))
+        
     
 def get_MNIST_datasets():
     """Load MNIST train and test datasets into memory."""
@@ -210,8 +222,8 @@ def get_MNIST_datasets():
     ds_builder.download_and_prepare()
     train_ds = tfds.as_numpy(ds_builder.as_dataset(split='train', batch_size=-1))
     test_ds = tfds.as_numpy(ds_builder.as_dataset(split='test', batch_size=-1))
-    train_ds['image'] = jnp.float32(train_ds['image']) / 255.
-    test_ds['image'] = jnp.float32(test_ds['image']) / 255.
+#     train_ds['image'] = jnp.float32(train_ds['image']) / 255.
+#     test_ds['image'] = jnp.float32(test_ds['image']) / 255.
     return train_ds, test_ds
     
 def MNIST_test():
@@ -230,6 +242,7 @@ def MNIST_test():
             dropout_rate=0.1
         )
     model = ParallelizedModel(MnistViT, config, (28, 28))
+#     model = ParallelizedModel(CNN, config, (28, 28, 1))
     
     # random seed for shuffling training dataset
     rng = jax.random.PRNGKey(0)
@@ -237,22 +250,19 @@ def MNIST_test():
     
     # create initial train state
     optimizer = optax.sgd
-    learning_rate = 0.1
+    learning_rate = 1e-3
     momentum = 0.9
     model.create_train_state(optimizer, learning_rate = learning_rate, momentum = momentum)
     
     num_epochs = 10
-    batch_size = 128
+    batch_size = 64
     for epoch in range(1, num_epochs + 1):
         # Use a separate PRNG key to permute image data during shuffling
         rng, input_rng = jax.random.split(rng)
         # Run an optimization step over a training batch
         model.train_epoch(train_ds, batch_size, epoch, input_rng)
         # Evaluate on the test set after each training epoch
-        test_loss, test_accuracy = model.eval_model(test_ds)
-        print(' test epoch: %d, loss: %.2f, accuracy: %.2f' % (
-          epoch, test_loss, test_accuracy * 100))
-        
+        model.eval_model(test_ds, batch_size, epoch)        
 
 if __name__ == '__main__':
     MNIST_test()
