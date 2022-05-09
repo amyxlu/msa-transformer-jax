@@ -508,7 +508,7 @@ class TransformerEncoderLayer(nn.Module):
 
         x = SelfAttention(
             num_heads=self.config.n_heads,
-            qkv_features=self.config.d_qkv,
+            qkv_features=self.config.d_qkv*self.config.n_heads,
             kernel_init=self.config.kernel_init,
             bias_init=self.config.bias_init,
             dropout_rate=self.config.dropout_rate
