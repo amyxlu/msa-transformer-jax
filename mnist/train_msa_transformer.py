@@ -1,20 +1,14 @@
+import sys
+sys.path.append("..")
+
 import jax
 from jax import random, numpy as jnp
-
-from flax import linen as nn
 from flax.training import train_state
-
 import numpy as np
 import optax
 import tensorflow_datasets as tfds
-
-import os
 from tqdm import tqdm
 
-import sys
-
-sys.path.append("..")
-import tensor_model as tm
 from msa_transformer import MSATransformer
 from configs import MSATransformerConfig
 
@@ -36,7 +30,8 @@ def get_datasets():
 
 def cross_entropy_loss(logits, labels):
     labels_onehot = jax.nn.one_hot(labels, num_classes=10)
-    return optax.softmax_cross_entropy(logits=logits, labels=labels_onehot).mean()
+    loss = optax.softmax_cross_entropy(logits=logits, labels=labels_onehot)
+    return jnp.mean(loss)
 
 
 def compute_metrics(logits, labels):
@@ -47,15 +42,19 @@ def compute_metrics(logits, labels):
 
 @jax.jit
 def train_step(state, batch):
+    image = batch['image']
+    if image.ndim != 3:
+        image = image.squeeze()
+
     def loss_fn(params):
         model = MSATransformer(cfg)
         rng = random.PRNGKey(42)  # TODO: remove harcoded rng
-        logits = model.apply({'params': params}, batch['image'], rngs={'dropout': rng})
+        logits = model.apply({'params': params}, inputs=image, train=True, rngs={'dropout': rng})
         loss = cross_entropy_loss(logits, batch['label'])
         return loss, logits
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    logits, grads = grad_fn(state.params)
+    (_, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
     metrics = compute_metrics(logits, batch['label'])
     return state, metrics
@@ -100,7 +99,11 @@ def train_epoch(state, train_ds, epoch, rng):
 def eval_step(params, batch):
     model = MSATransformer(cfg)
     rng = random.PRNGKey(42)  # TODO: remove harcoded rng
-    logits = model.apply({'params': params}, batch['image'], rngs={'dropout': rng})
+    image = batch['image']
+    if image.ndim != 3:
+        image = image.squeeze()
+
+    logits = model.apply({'params': params}, inputs=image, train=False, rngs={'dropout': rng})
     return compute_metrics(logits, batch['label'])
 
 
@@ -128,12 +131,12 @@ if __name__ == "__main__":
     dummy_input_shape = (4, 28, 28)
     dummy_input_logits = random.uniform(init_rng, (*dummy_input_shape, 255))
     dummy_input = random.categorical(init_rng, dummy_input_logits, axis=-1)
-    params = model.init({'params': rng, 'dropout': dropout_rng}, dummy_input)#['params']
+    params = model.init({'params': rng, 'dropout': dropout_rng}, dummy_input)['params']
     print(jax.tree_map(lambda x: print(x.shape), params))
 
     # Create optimizer and state
     tx = optax.sgd(LEARNING_RATE, MOMENTUM)
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params['params'], tx=tx)
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
     # Train model and take snapshot on test data every epoch
     for epoch in tqdm(range(1, NUM_EPOCHS + 1)):

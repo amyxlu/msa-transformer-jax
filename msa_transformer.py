@@ -105,8 +105,7 @@ class MSATransformer(nn.Module):
             return representations, logits
 
         elif self.input_type == "mnist":
-            batch_size = x.shape[0]
-            x = x.reshape(batch_size, -1)
+            x = jnp.mean(x, axis=(1, 2))  # (N, H, W, D) -> (N, D)
             logits = nn.Dense(10)(x)
             return logits
 
@@ -193,5 +192,3 @@ if __name__ == "__main__":
     msa_transformer = MSATransformer(cfg, "mnist")
     msa_transformer_params = msa_transformer.init({"params": init_rng, "dropout": dropout_rng}, dummy_input)
     out = msa_transformer.apply(msa_transformer_params, dummy_input, train=True, rngs={"dropout": dropout_rng})
-
-    labels = train_ds['label']
