@@ -18,6 +18,7 @@ class MLMHead(nn.Module):
 
     @nn.compact
     def __call__(self, x: Array):
+        # (B, R, C, D)
         cfg = self.config
 
         x = nn.gelu(x)
@@ -32,10 +33,10 @@ class MLMHead(nn.Module):
 
 class MSATransformer(nn.Module):
     config: MSATransformerConfig
-    alphabet: MSATransformerAlphabet
+    input_type: str = "mnist"
 
     @nn.compact
-    def __call__(self, tokens: Array, train: bool = False) -> Array:
+    def __call__(self, inputs: Array, train: bool = False) -> Array:
         """
         Note: unlike ESM implementation, does not return contacts,
         attention head weights, or representations from a specific layer.
@@ -48,16 +49,25 @@ class MSATransformer(nn.Module):
             output: output to feed into MLM head.
         """
         cfg = self.config
-        assert len(self.alphabet.tok_to_idx) == cfg.vocab_size
-        assert tokens.ndim == 3
-        batch_size, num_alignments, seqlen = tokens.shape
-        padding_mask = jnp.equal(tokens, self.alphabet.padding_idx)  # (B, R, C)
+        alphabet = None
+        assert self.input_type in ['mnist', 'msa'], "Input type must be 'mnist' or 'msa'."
+        if self.input_type == "msa":
+            alphabet = MSATransformerAlphabet()
+
+        if not inputs.ndim == 3:
+            inputs = inputs.squeeze()
+
+        if not alphabet is None:
+            assert len(alphabet.tok_to_idx) == cfg.vocab_size
+            padding_mask = jnp.equal(inputs, alphabet.padding_idx)  # (B, R, C)
+        else:
+            padding_mask = None
 
         """
         Embed and add positional token
         """
         # (batch_size, n_rows, n_cols) -> (B, R, C, ffn_emb_dim)
-        x = nn.Embed(num_embeddings=cfg.vocab_size, features=cfg.embed_dim)(tokens)
+        x = nn.Embed(num_embeddings=cfg.vocab_size, features=cfg.embed_dim)(inputs)
 
         # The positional embeddings used in MSA transformer is not a
         # sinuosoidal embedding, but a learned embedding. Ignore this for now.
@@ -65,7 +75,8 @@ class MSATransformer(nn.Module):
 
         x = nn.LayerNorm(dtype=x.dtype)(x)
         x = nn.Dropout(cfg.dropout)(x, deterministic=not train)
-        x = x * (1 - jnp.expand_dims(padding_mask, axis=3))
+        if not padding_mask is None:
+            x = x * (1 - jnp.expand_dims(padding_mask, axis=3))
 
         # For some reason, this is the orientation used
         # for the attention modules. I *think* if this wasn't the case
@@ -88,9 +99,20 @@ class MSATransformer(nn.Module):
         x = jnp.transpose(x, (2, 0, 1, 3))  # R x C x B x D -> B x R x C x D
 
         representations = x.copy()
-        logits = MLMHead(cfg)(x)
 
-        return representations, logits
+        if self.input_type == "msa":
+            logits = MLMHead(cfg)(x)
+            return representations, logits
+
+        elif self.input_type == "mnist":
+            batch_size = x.shape[0]
+            x = x.reshape(batch_size, -1)
+            logits = nn.Dense(10)(x)
+            return logits
+
+        else:
+            raise NotImplementedError
+
 
 if __name__ == "__main__":
     from pathlib import Path
@@ -153,11 +175,23 @@ if __name__ == "__main__":
     cfg = MSATransformerConfig()
     alphabet = MSATransformerAlphabet()
 
+    # MSA #####
     # Initialize dummy arrays
     # tokens = random.randint(input_rng, (4, 64, 448), 0, 33)
-    tokens = dummy_tokens()   # (N_msas, max_msa_depth, max_seq_len)
-    msa_transformer = MSATransformer(cfg, alphabet)
-    msa_transformer_params = msa_transformer.init({"params": init_rng, "dropout": dropout_rng}, tokens)
-    out = msa_transformer.apply(msa_transformer_params, tokens, deterministic=True)
+    # tokens = dummy_tokens()   # (N_msas, max_msa_depth, max_seq_len)
+    # msa_transformer = MSATransformer(cfg, "mnist")
+    # msa_transformer_params = msa_transformer.init({"params": init_rng, "dropout": dropout_rng}, tokens)
+    # out = msa_transformer.apply(msa_transformer_params, tokens, deterministic=True)
 
-    print(jax.tree_map(lambda x: print(x.shape), msa_transformer_params))
+    # print(jax.tree_map(lambda x: print(x.shape), msa_transformer_params))
+
+
+    # MNIST #####
+    dummy_input_shape = (4, 28, 28)
+    dummy_input_logits = random.uniform(init_rng, (*dummy_input_shape, 255))
+    dummy_input = random.categorical(init_rng, dummy_input_logits, axis=-1)
+    msa_transformer = MSATransformer(cfg, "mnist")
+    msa_transformer_params = msa_transformer.init({"params": init_rng, "dropout": dropout_rng}, dummy_input)
+    out = msa_transformer.apply(msa_transformer_params, dummy_input, train=True, rngs={"dropout": dropout_rng})
+
+    labels = train_ds['label']
